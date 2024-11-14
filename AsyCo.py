@@ -252,11 +252,61 @@ def DPLL_coteaching_train(train_loader, model_a, model_b, optimizer, epoch, cons
         y_pred_aug2_b_probas = torch.softmax(y_pred_aug2_b / args.tau, dim=-1)
 
         '''for comparison'''
+        y_pred_probas_a = torch.cat([y_pred_aug0_a_probas, y_pred_aug1_a_probas, y_pred_aug2_a_probas], dim=0)
+        y_pred_probas_b = torch.cat([y_pred_aug0_b_probas, y_pred_aug1_b_probas, y_pred_aug2_b_probas], dim=0)
+        pred_label_a = torch.max(y_pred_probas_a, dim=-1)[1]
+        pred_label_b = torch.max(y_pred_probas_b, dim=-1)[1]
+        same_ratios.update(torch.mean((pred_label_a == pred_label_b).float()))
 
+        base_confidence_a = torch.tensor(confidence[index]).float().cuda()
+        consist_loss0_a = consistency_criterion(y_pred_aug0_a_probas_log, base_confidence_a, reduce=False)
+        consist_loss1_a = consistency_criterion(y_pred_aug1_a_probas_log, base_confidence_a, reduce=False)
+        consist_loss2_a = consistency_criterion(y_pred_aug2_a_probas_log, base_confidence_a, reduce=False)
+
+        base_confidence_b = part_y.clone() * y_pred_aug0_b_probas.clone().detach()
+        base_confidence_b = base_confidence_b / torch.sum(base_confidence_b + 0.0000001, dim=1, keepdim=True)
+        selftrain_loss0_b = consistency_criterion(y_pred_aug0_b_probas_log, base_confidence_b)
+        selftrain_loss1_b = consistency_criterion(y_pred_aug1_b_probas_log, base_confidence_b)
+        selftrain_loss2_b = consistency_criterion(y_pred_aug2_b_probas_log, base_confidence_b)
+
+        consist_loss = consist_loss0_a + consist_loss1_a + consist_loss2_a
+        selftrain_loss_b = selftrain_loss0_b + selftrain_loss1_b + selftrain_loss2_b
+
+        # supervised loss
+        # 考虑三个样本所形成的 super loss
+        super_loss_a = - torch.log(
+            (F.softmax(y_pred_aug0_a / args.tau, dim=1) * part_y).sum(dim=1) + 0.000001).mean() - torch.log(
+            (F.softmax(y_pred_aug1_a / args.tau, dim=1) * part_y).sum(dim=1) + 0.000001).mean() - torch.log(
+            (F.softmax(y_pred_aug2_a / args.tau, dim=1) * part_y).sum(dim=1) + 0.000001).mean()
+
+        # 按照 clean data 来训练
+        pseudo_label = torch.argmax(base_confidence_a, dim=-1)
+        noise_or_not = pseudo_label == y
+        alignlosses = F.kl_div(y_pred_aug0_a_probas_log, y_pred_aug0_b_probas, reduction='none')
+        alignlosses = torch.sum(alignlosses, dim=-1)
+
+        mom_noise_mask = np.argmax(confidence[index], axis=1) == np.argmax(momen_confidence[index], axis=1)
+        mom_noise_rate = torch.sum(noise_or_not[mom_noise_mask]) / np.sum(mom_noise_mask)
+
+        # 对 NLL 模型添加 confidence-based structural similarity
+        conf_struct_loss = (loss_structure_kl(base_confidence_a, x_aug0_feat_b) +
+                            loss_structure_kl(base_confidence_a, x_aug1_feat_b) +
+                            loss_structure_kl(base_confidence_a, x_aug2_feat_b)) / 3
+        # label similarity
+        pseudo_onehot_label = torch.zeros_like(base_confidence_a)
+        pseudo_onehot_label[torch.arange(x_aug0.shape[0]), pseudo_label] = 1
+        similarity_matrix = pseudo_onehot_label.matmul(pseudo_onehot_label.transpose(0, 1))
+        # sim_struct_loss = (loss_structure_binary(x_aug0_feat_b, similarity_matrix) \
+        #                    + loss_structure_binary(x_aug1_feat_b, similarity_matrix) \
+        #                    + loss_structure_binary(x_aug2_feat_b, similarity_matrix)) / 3
+        sim_struct_loss = (loss_structure_binary_prob(y_pred_aug0_b_probas, similarity_matrix) \
+                           + loss_structure_binary_prob(y_pred_aug1_b_probas, similarity_matrix) \
+                           + loss_structure_binary_prob(y_pred_aug2_b_probas, similarity_matrix)) / 3
 
         # print(sim_struct_loss)
 
-        # Detail Code will be released after the paper accepted
+        lam = min((epoch / 100) * args.lam, args.lam * 0.5)
+
         final_loss = None
         optimizer.zero_grad()
         final_loss.backward()
